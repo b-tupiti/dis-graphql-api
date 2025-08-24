@@ -5,20 +5,14 @@ import strawberry
 from strawberry.fastapi import GraphQLRouter
 from typing import List, Optional
 from boto3.dynamodb.conditions import Key
-
+from decimal import Decimal
 
 app = FastAPI()
 
 dynamodb = boto3.resource('dynamodb', region_name='eu-west-2')
 products_table = dynamodb.Table('products')
 reviews_table = dynamodb.Table('reviews')
-
-@strawberry.type
-class Product:
-    product_id: str
-    name: str | None = None
-    price: float | None = None
-    description: str | None = None
+inventory_table = dynamodb.Table('inventory')
 
 @strawberry.type
 class Review:
@@ -27,73 +21,96 @@ class Review:
     rating: int
     comment: str
 
+@strawberry.type
+class Inventory:
+    product_id: str
+    quantity_available: int
+    location: str
+
+@strawberry.type
+class Product:
+    product_id: str
+    name: str | None = None
+    price: float | None = None
+    description: str | None = None
+
+    # These are the nested resolvers that Strawberry automatically calls
+    # when the query asks for them. They receive the parent `Product` object.
+    @strawberry.field
+    async def reviews(self) -> List[Review]:
+        response = reviews_table.query(
+            KeyConditionExpression=Key('product_id').eq(self.product_id)
+        )
+        return [Review(**item) for item in response.get('Items', [])]
+
+    @strawberry.field
+    async def inventory(self) -> Optional[Inventory]:
+        response = inventory_table.get_item(
+            Key={'product_id': self.product_id}
+        )
+        item = response.get('Item')
+        if not item:
+            # The resolver now correctly returns None, which is allowed
+            # by the Optional[Inventory] type hint.
+            return None 
+        return Inventory(**item)
+
 # Define the GraphQL Query
 @strawberry.type
 class Query:
     @strawberry.field
-    async def get_product(self, product_id: str) -> Product:
+    async def get_product(self, product_id: str) -> Optional[Product]:
         try:
-            # Fetch item from DynamoDB
             response = products_table.get_item(Key={'product_id': product_id})
             item = response.get('Item')
             if not item:
-                raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
+                return None
             
-            # Convert DynamoDB item to Product type
             return Product(
                 product_id=item['product_id'],
                 name=item.get('name'),
-                price=item.get('price'),
+                # Convert the Decimal from DynamoDB to float for Strawberry
+                price=float(item.get('price')) if item.get('price') else None,
                 description=item.get('description')
             )
         except ClientError as e:
-            # Handle DynamoDB-specific errors
             error_code = e.response['Error']['Code']
             error_message = e.response['Error']['Message']
             raise HTTPException(status_code=500, detail=f"DynamoDB error: {error_code} - {error_message}")
         except Exception as e:
-            # Handle unexpected errors
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
     @strawberry.field
-    async def get_reviews(self, product_id: str) -> List[Review]:
-        """
-        Fetches all reviews for a given product ID.
-        This is the GraphQL equivalent of the previous REST endpoint.
-        """
+    async def list_products(self) -> List[Product]:
         try:
-            # The resolver function uses the DynamoDB query operation.
-            response = reviews_table.query(
-                KeyConditionExpression=Key('product_id').eq(product_id)
-            )
+            response = products_table.scan()
+            items = response.get('Items', [])
             
-            # The 'Items' key contains the list of all matching reviews
-            dynamo_reviews = response.get('Items', [])
-            
-            # We are now trusting that Strawberry will handle the Optional[int] correctly
-            # and will not filter out any reviews from the response.
-            reviews = [
-                Review(
-                    product_id=item.get('product_id'),
-                    review_id=item.get('review_id'),
-                    rating=item.get('rating'),
-                    comment=item.get('comment')
-                ) for item in dynamo_reviews
+            # Continue scanning if there are more items
+            while 'LastEvaluatedKey' in response:
+                response = products_table.scan(
+                    ExclusiveStartKey=response['LastEvaluatedKey']
+                )
+                items.extend(response.get('Items', []))
+
+            # Convert DynamoDB Decimal types to floats for Strawberry
+            products = [
+                Product(
+                    product_id=item['product_id'],
+                    name=item.get('name'),
+                    price=float(item.get('price')) if item.get('price') else None,
+                    description=item.get('description')
+                ) for item in items
             ]
             
-            # Since the return type is List[Review], we can return an empty list
-            # if no reviews are found. Strawberry will handle the serialization.
-            return reviews
+            return products
         except ClientError as e:
-            # Handle DynamoDB-specific errors
             error_code = e.response['Error']['Code']
             error_message = e.response['Error']['Message']
             raise HTTPException(status_code=500, detail=f"DynamoDB error: {error_code} - {error_message}")
         except Exception as e:
-            # Handle unexpected errors
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
-
-
+        
 # Define the GraphQL Mutation type
 @strawberry.type
 class Mutation:
@@ -106,29 +123,31 @@ class Mutation:
         description: Optional[str] = None
     ) -> Product:
         try:
-            # Build the update expression to update only the fields that were provided
-            update_expression = "SET "
+            update_expression_parts = []
             expression_attribute_values = {}
+            expression_attribute_names = {}
             
             if name is not None:
-                update_expression += "name = :n, "
+                update_expression_parts.append("#n = :n")
                 expression_attribute_values[":n"] = name
+                expression_attribute_names["#n"] = "name"
             
             if price is not None:
-                update_expression += "price = :p, "
-                expression_attribute_values[":p"] = price
+                update_expression_parts.append("price = :p")
+                expression_attribute_values[":p"] = Decimal(str(price))
             
             if description is not None:
-                update_expression += "description = :d, "
+                update_expression_parts.append("#d = :d")
                 expression_attribute_values[":d"] = description
+                expression_attribute_names["#d"] = "description"
             
-            # Remove the trailing comma and space
-            update_expression = update_expression.rstrip(", ")
+            update_expression = "SET " + ", ".join(update_expression_parts)
 
             response = products_table.update_item(
                 Key={'product_id': product_id},
                 UpdateExpression=update_expression,
                 ExpressionAttributeValues=expression_attribute_values,
+                ExpressionAttributeNames=expression_attribute_names,
                 ReturnValues="UPDATED_NEW"
             )
 
@@ -136,10 +155,11 @@ class Mutation:
             if not updated_item:
                 raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
 
+            # Convert the Decimal from DynamoDB to float before returning
             return Product(
                 product_id=product_id,
                 name=updated_item.get('name'),
-                price=updated_item.get('price'),
+                price=float(updated_item.get('price')) if updated_item.get('price') else None,
                 description=updated_item.get('description')
             )
         except ClientError as e:
@@ -149,7 +169,6 @@ class Mutation:
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-
-schema = strawberry.Schema(query=Query)
+schema = strawberry.Schema(query=Query, mutation=Mutation)
 graphql_app = GraphQLRouter(schema)
 app.include_router(graphql_app, prefix="/graphql")
