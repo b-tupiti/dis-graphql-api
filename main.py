@@ -3,7 +3,7 @@ import boto3
 from botocore.exceptions import ClientError
 import strawberry
 from strawberry.fastapi import GraphQLRouter
-from typing import List
+from typing import List, Optional
 from boto3.dynamodb.conditions import Key
 
 
@@ -92,6 +92,63 @@ class Query:
         except Exception as e:
             # Handle unexpected errors
             raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# Define the GraphQL Mutation type
+@strawberry.type
+class Mutation:
+    @strawberry.mutation
+    async def update_product(
+        self,
+        product_id: str,
+        name: Optional[str] = None,
+        price: Optional[float] = None,
+        description: Optional[str] = None
+    ) -> Product:
+        try:
+            # Build the update expression to update only the fields that were provided
+            update_expression = "SET "
+            expression_attribute_values = {}
+            
+            if name is not None:
+                update_expression += "name = :n, "
+                expression_attribute_values[":n"] = name
+            
+            if price is not None:
+                update_expression += "price = :p, "
+                expression_attribute_values[":p"] = price
+            
+            if description is not None:
+                update_expression += "description = :d, "
+                expression_attribute_values[":d"] = description
+            
+            # Remove the trailing comma and space
+            update_expression = update_expression.rstrip(", ")
+
+            response = products_table.update_item(
+                Key={'product_id': product_id},
+                UpdateExpression=update_expression,
+                ExpressionAttributeValues=expression_attribute_values,
+                ReturnValues="UPDATED_NEW"
+            )
+
+            updated_item = response.get('Attributes')
+            if not updated_item:
+                raise HTTPException(status_code=404, detail=f"Product with ID {product_id} not found")
+
+            return Product(
+                product_id=product_id,
+                name=updated_item.get('name'),
+                price=updated_item.get('price'),
+                description=updated_item.get('description')
+            )
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            error_message = e.response['Error']['Message']
+            raise HTTPException(status_code=500, detail=f"DynamoDB error: {error_code} - {error_message}")
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
 
 schema = strawberry.Schema(query=Query)
 graphql_app = GraphQLRouter(schema)
